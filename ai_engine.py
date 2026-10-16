@@ -1,19 +1,40 @@
+
 import os
 import json
 import re
 
+import streamlit as st
 from dotenv import load_dotenv
 from groq import Groq
 from schemas import CandidateAnalysis
 
+
+# --------------------------------------------------
+# 1. LOAD ENVIRONMENT VARIABLES AND GROQ API KEY
+# --------------------------------------------------
+
 load_dotenv()
 
-api_key = os.getenv("GROQ_API_KEY")
+# Read Streamlit Cloud secrets first.
+# Fall back to the local .env file if necessary.
+try:
+    api_key = st.secrets.get("GROQ_API_KEY")
+except Exception:
+    api_key = None
+
+if not api_key:
+    api_key = os.getenv("GROQ_API_KEY")
+
 client = Groq(api_key=api_key) if api_key else None
 
 
+# --------------------------------------------------
+# 2. CLEAN AND NORMALIZE SKILLS
+# --------------------------------------------------
+
 def clean_list(value):
     """Return unique, non-empty strings."""
+
     if isinstance(value, str):
         value = [value]
 
@@ -36,12 +57,18 @@ def clean_list(value):
 
 
 def normalize_skill(skill):
-    """Normalize text for comparison."""
+    """Normalize text for skill comparison."""
+
     return re.sub(r"\s+", " ", skill.casefold()).strip()
 
 
+# --------------------------------------------------
+# 3. PARSE JSON RESPONSE
+# --------------------------------------------------
+
 def extract_json(content):
-    """Parse a JSON response, including one wrapped in code fences."""
+    """Parse a JSON response, including code fences."""
+
     if not content:
         raise ValueError("Groq returned an empty response.")
 
@@ -74,25 +101,33 @@ def extract_json(content):
     return data
 
 
+# --------------------------------------------------
+# 4. ANALYZE RESUME AGAINST JOB DESCRIPTION
+# --------------------------------------------------
+
 def analyze_resume(resume_text, job_description):
     """
     Analyze a resume against a job description.
 
-    Groq extracts skills and identifies relevant requirements.
+    Groq extracts skills and relevant requirements.
     Python calculates the final match percentage.
     """
 
+    # Verify API configuration.
     if client is None:
-                raise ValueError(
-            "GROQ_API_KEY is missing. Check your .env file or Streamlit secrets."
+        raise ValueError(
+            "GROQ_API_KEY is missing. Add it to your local .env "
+            "file or Streamlit Cloud Secrets."
         )
 
+    # Validate input.
     if not resume_text or not resume_text.strip():
         raise ValueError("No readable text found in the resume.")
 
     if not job_description or not job_description.strip():
         raise ValueError("Please enter a job description.")
 
+    # Build prompt.
     prompt = f"""
 You are a resume screening assistant.
 
@@ -130,6 +165,7 @@ Rules:
 13. Return JSON only, without Markdown or additional commentary.
 """
 
+    # Call Groq.
     try:
         response = client.chat.completions.create(
             model="openai/gpt-oss-20b",
@@ -159,6 +195,7 @@ Rules:
         )
 
     except Exception as exc:
+        # Keep diagnostic details in the server logs.
         print(
             f"Groq analysis error: "
             f"{type(exc).__name__}: {exc}"
@@ -168,7 +205,10 @@ Rules:
             f"Groq error ({type(exc).__name__}): {exc}"
         ) from exc
 
-    # Clean and validate the extracted fields.
+    # --------------------------------------------------
+    # 5. VALIDATE AND CLEAN RESPONSE FIELDS
+    # --------------------------------------------------
+
     candidate_name = result.get("candidate_name", "Unknown")
 
     if not isinstance(candidate_name, str):
@@ -178,13 +218,15 @@ Rules:
         candidate_name.strip() or "Unknown"
     )
 
-    for field in (
+    list_fields = (
         "skills",
         "required_skills",
         "matched_skills",
         "strengths",
         "missing_skills",
-    ):
+    )
+
+    for field in list_fields:
         result[field] = clean_list(result.get(field, []))
 
     summary = result.get("summary", "")
@@ -193,15 +235,31 @@ Rules:
         summary.strip() if isinstance(summary, str) else ""
     )
 
-    # Remove duplicate requirements while preserving their order.
+    # --------------------------------------------------
+    # 6. CALCULATE MATCHED AND MISSING SKILLS
+    # --------------------------------------------------
+
     required = result["required_skills"]
+
+    # Remove duplicate required skills while preserving order.
+    unique_required = []
+    required_keys = set()
+
+    for skill in required:
+        key = normalize_skill(skill)
+
+        if key not in required_keys:
+            unique_required.append(skill)
+            required_keys.add(key)
+
+    required = unique_required
 
     required_lookup = {
         normalize_skill(skill): skill
         for skill in required
     }
 
-    # Only accept matches that correspond to a required skill.
+    # Accept matches only when they correspond to a required skill.
     matched = []
     matched_keys = set()
 
@@ -212,14 +270,17 @@ Rules:
             matched.append(required_lookup[key])
             matched_keys.add(key)
 
-    # Calculate missing skills from the final matched list.
+    # Determine missing skills from final matches.
     missing = [
         skill
         for skill in required
         if normalize_skill(skill) not in matched_keys
     ]
 
-    # Python calculates the score, never the LLM.
+    # --------------------------------------------------
+    # 7. CALCULATE MATCH SCORE IN PYTHON
+    # --------------------------------------------------
+
     if required:
         score = round(
             len(matched) / len(required) * 100,
@@ -233,5 +294,8 @@ Rules:
     result["missing_skills"] = missing
     result["match_score"] = score
 
-    # Return the validated Pydantic model used by the app.
+    # --------------------------------------------------
+    # 8. RETURN VALIDATED CANDIDATE ANALYSIS
+    # --------------------------------------------------
+
     return CandidateAnalysis.model_validate(result)
